@@ -26,7 +26,7 @@ Without `--payload`, provide one JSON value on standard input:
 printf '%s' '{"item":"book"}' | node molt-event.mjs --key identity.json --ledger events.jsonl --type record.created --actor alice
 ```
 
-The command prints the canonical event as one JSON line after appending it to the ledger. It creates a missing ledger. Errors go to stderr, return a non-zero exit status, and do not append an event. Existing non-empty ledger lines must each be valid JSON objects with a 64-character lowercase hexadecimal `hash` field. The tool counts non-empty lines for the next sequence number and uses the last event's hash as `prev_hash`; it does not independently verify the prior events' signatures or the complete chain.
+The command prints the canonical event as one JSON line after appending it to the ledger. It creates a missing ledger. Before appending to an existing ledger, it verifies every canonical Camp 1 event, the sequence and hash chain, and each Ed25519 signature. It rejects malformed, tampered, non-Camp-1, blank-line, non-newline-terminated, or mixed-key ledgers without modification, and it will not append with a different key. Use `molt-verify` for package-level actor-key binding and artifact validation.
 
 ## Identity files
 
@@ -50,15 +50,15 @@ Each ledger line is a canonical JSON object with exactly these fields:
 - `sig`: Ed25519 signature as 128 lowercase hex characters
 - `hash`: SHA-256 digest as 64 lowercase hex characters
 
-The body contains `seq`, `ts`, `type`, `actor`, `payload`, `prev_hash`, and `pub`, with no `sig` or `hash`. The attached `canonicalizeJsonText` function from `molt-canonical.mjs` canonicalizes both the body and the complete event.
+Camp 1 is the MOLT-CORE event scheme. The signed body contains exactly `seq`, `ts`, `type`, `payload`, and `actor`; `prev_hash`, `pub`, `sig`, and `hash` are not part of that body. `canonicalizeJsonText` canonicalizes the five-field body and the complete event.
 
-Let `C` be the canonical body string and `P` be the `prev_hash` string:
+Let `C` be the canonical body bytes and `P` the 64-character lowercase hexadecimal `prev_hash` text:
 
 - `hash = lowercase_hex(SHA-256(UTF-8(P || C)))`
-- `sig = lowercase_hex(Ed25519_sign(private_key, UTF-8(C)))`
+- `sig = lowercase_hex(Ed25519_sign(private_key, decode_hex(hash)))`
 
-The hash concatenation uses the 64-character hexadecimal text of `prev_hash`, followed directly by the canonical body bytes. The signature covers only the canonical body bytes, not the hash or full event. The completed event is canonicalized, then appended with one newline.
+The signature covers the 32 raw hash bytes. The completed event is canonicalized and appended with one newline. This matches `molt-verify`, `molt-verify-ledger`, and the Camp 1 writer in `molt-audit` for ASCII event content. MOLT-CORE leaves non-ASCII canonicalization open; do not rely on cross-implementation agreement for non-ASCII fields until that ruling is settled.
 
 ## Pairing with molt-canonical and molt-sign
 
-`molt-canonical.mjs` is the canonicalization implementation imported by this tool. The event tool then signs the exact canonical body bytes with Node's built-in Ed25519 support, following the same identity formats and signing primitive as `molt-sign`. `molt-sign` can verify the event's signature by extracting the event body, canonicalizing it with `molt-canonical`, and verifying against `pub`. The event `hash` additionally binds the previous event hash to the body. Use the separate MOLT L1 verifier when you need to validate a whole ledger; this append tool is not a ledger verifier.
+`molt-canonical.mjs` is the canonicalization implementation imported by this tool. The tool signs the raw 32-byte event hash with Node's built-in Ed25519 support and accepts the identity formats also used by `molt-sign`. To verify an event with `molt-sign`, pass the decoded hash bytes as the message. The event hash binds the previous event hash to the canonical five-field body. Before appending, this writer checks the existing ledger's Camp 1 chain and signatures. Use `molt-verify` for full package validation, including manifest bindings and artifacts.
