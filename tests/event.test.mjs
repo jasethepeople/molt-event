@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createHash, createPublicKey, generateKeyPairSync, verify } from 'node:crypto';
+import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign, verify } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
@@ -10,6 +10,7 @@ import { canonicalizeJsonText } from '../molt-canonical.mjs';
 const root = path.resolve(import.meta.dirname, '..');
 const script = path.join(root, 'molt-event.mjs');
 const PUBLIC_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
+const PRIVATE_PREFIX = Buffer.from('302e020100300506032b657004220420', 'hex');
 const ZERO_HASH = '0'.repeat(64);
 const temporaryDirectories = new Set();
 
@@ -69,9 +70,8 @@ async function getEvents(ledger) {
   return (await readFile(ledger, 'utf8')).trimEnd().split('\n').map(line => JSON.parse(line));
 }
 
-function bodyWithoutSignatureAndHash(event) {
-  const { sig, hash, ...body } = event;
-  return body;
+function camp1SignedBody(event) {
+  return { seq: event.seq, ts: event.ts, type: event.type, payload: event.payload, actor: event.actor };
 }
 
 function publicKeyFromRaw(raw) {
@@ -106,28 +106,27 @@ test('second event chains to the first and leaves two ledger lines', async () =>
   assert.equal(events[1].prev_hash, events[0].hash);
 });
 
-test('event hashes recompute from previous hash and canonical body', async () => {
+test('Camp 1 event hashes use the canonical five-field body', async () => {
   const f = await fixture();
   await appendPayload(f, { item: 'one' });
   await appendPayload(f, ['two', 2]);
   const events = await getEvents(f.ledger);
   for (const event of events) {
-    const canonicalBody = canonicalizeJsonText(JSON.stringify(bodyWithoutSignatureAndHash(event)));
+    const canonicalBody = canonicalizeJsonText(JSON.stringify(camp1SignedBody(event)));
     const expected = createHash('sha256').update(`${event.prev_hash}${canonicalBody}`, 'utf8').digest('hex');
     assert.equal(event.hash, expected);
   }
 });
 
-test('event signatures verify directly with Node crypto over canonical body bytes', async () => {
+test('Camp 1 event signatures verify over the 32 raw hash bytes', async () => {
   const f = await fixture();
   await appendPayload(f, { signed: true });
   await appendPayload(f, { signed: 'also' });
   const events = await getEvents(f.ledger);
   const publicKey = publicKeyFromRaw(f.publicBytes);
   for (const event of events) {
-    const canonicalBody = canonicalizeJsonText(JSON.stringify(bodyWithoutSignatureAndHash(event)));
     assert.equal(event.pub, f.publicHex);
-    assert.equal(verify(null, Buffer.from(canonicalBody, 'utf8'), publicKey, Buffer.from(event.sig, 'hex')), true);
+    assert.equal(verify(null, Buffer.from(event.hash, 'hex'), publicKey, Buffer.from(event.sig, 'hex')), true);
   }
 });
 
@@ -166,6 +165,51 @@ test('malformed ledger JSON fails without changing the ledger', async () => {
   const result = runEvent(f);
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /invalid JSON/i);
+  assert.equal(await readFile(f.ledger, 'utf8'), original);
+});
+
+test('refuses the earlier seven-field scheme rather than mixing ledger formats', async () => {
+  const f = await fixture();
+  const body = {
+    seq: 0,
+    ts: 1700000000,
+    type: 'record.created',
+    actor: 'alice',
+    payload: { n: 1 },
+    prev_hash: ZERO_HASH,
+    pub: f.publicHex,
+  };
+  const canonicalBody = canonicalizeJsonText(JSON.stringify(body));
+  const hash = createHash('sha256').update(`${ZERO_HASH}${canonicalBody}`, 'utf8').digest('hex');
+  const privateKey = createPrivateKey({
+    key: Buffer.concat([PRIVATE_PREFIX, Buffer.from(f.privateHex, 'hex')]),
+    format: 'der',
+    type: 'pkcs8',
+  });
+  const sig = sign(null, Buffer.from(canonicalBody, 'utf8'), privateKey).toString('hex');
+  const legacyLedger = `${canonicalizeJsonText(JSON.stringify({ ...body, sig, hash }))}\n`;
+  await writeFile(f.ledger, legacyLedger);
+  await writeFile(f.payloadPath, '{}');
+
+  const result = runEvent(f);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Camp 1 hash scheme/);
+  assert.equal(await readFile(f.ledger, 'utf8'), legacyLedger);
+});
+
+test('refuses to append with a different package key', async () => {
+  const f = await fixture();
+  await appendPayload(f, { existing: true });
+  const original = await readFile(f.ledger, 'utf8');
+  const otherKeys = generateKeyPairSync('ed25519');
+  const otherPrivate = Buffer.from(otherKeys.privateKey.export({ format: 'der', type: 'pkcs8' })).subarray(-32).toString('hex');
+  const otherPublic = Buffer.from(otherKeys.publicKey.export({ format: 'der', type: 'spki' })).subarray(-32).toString('hex');
+  await writeIdentity(f.identityPath, otherPrivate, otherPublic);
+  await writeFile(f.payloadPath, '{}');
+
+  const result = runEvent(f);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /does not match the existing MOLT package ledger key/);
   assert.equal(await readFile(f.ledger, 'utf8'), original);
 });
 
